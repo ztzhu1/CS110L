@@ -1,8 +1,10 @@
+use crate::dwarf_data::DwarfData;
 use nix::sys::ptrace;
 use nix::sys::signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use std::process::Child;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command};
 
 pub enum Status {
     /// Indicates inferior stopped. Contains the signal that stopped the process, as well as the
@@ -34,12 +36,19 @@ impl Inferior {
     /// Attempts to start a new inferior process. Returns Some(Inferior) if successful, or None if
     /// an error is encountered.
     pub fn new(target: &str, args: &Vec<String>) -> Option<Inferior> {
-        // TODO: implement me!
-        println!(
-            "Inferior::new not implemented! target={}, args={:?}",
-            target, args
-        );
-        None
+        let mut cmd = Command::new(target);
+        cmd.args(args);
+        unsafe {
+            cmd.pre_exec(child_traceme);
+        }
+        let child = cmd.spawn().ok()?;
+
+        let inferior = Self { child };
+
+        match inferior.wait(None).ok()? {
+            Status::Stopped(_, _) => Some(inferior),
+            _ => None,
+        }
     }
 
     /// Returns the pid of this inferior.
@@ -59,5 +68,34 @@ impl Inferior {
             }
             other => panic!("waitpid returned unexpected status: {:?}", other),
         })
+    }
+
+    pub fn cont(&self) -> Result<Status, nix::Error> {
+        ptrace::cont(self.pid(), None)?;
+        self.wait(None)
+    }
+
+    pub fn kill(&mut self) {
+        self.child.kill().expect("fail to kill");
+    }
+
+    pub fn print_backtrace(&self, debug_data: &DwarfData) -> Result<(), nix::Error> {
+        // let pid = self.pid();
+        let regs = ptrace::getregs(self.pid())?;
+        let mut instruction_ptr = regs.rip as usize;
+        let mut base_ptr = regs.rbp as usize;
+        loop {
+            let line = debug_data.get_line_from_addr(instruction_ptr).unwrap();
+            let f = debug_data.get_function_from_addr(instruction_ptr).unwrap();
+            println!("{} ({})", f, line);
+            if f == "main" {
+                break;
+            }
+            let ret_addr = base_ptr + 8;
+            instruction_ptr =
+                ptrace::read(self.pid(), ret_addr as ptrace::AddressType).unwrap() as usize;
+            base_ptr = ptrace::read(self.pid(), base_ptr as ptrace::AddressType).unwrap() as usize;
+        }
+        Ok(())
     }
 }
